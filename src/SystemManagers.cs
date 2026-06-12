@@ -1,18 +1,16 @@
-using System.Net.NetworkInformation;
-using System.Net.Sockets;
 using System.Text.RegularExpressions;
 
 namespace WslPortProxyGuardian;
 
 public interface IPortProxyManager
 {
-    Task ApplyAsync(string listenAddress, PortMapping mapping, string connectAddress, bool dryRun, CancellationToken cancellationToken);
+    Task ApplyAsync(string listenAddress, PortMapping mapping, string connectAddress, bool replaceExistingRule, bool dryRun, CancellationToken cancellationToken);
     Task RemoveAsync(string listenAddress, PortMapping mapping, bool dryRun, CancellationToken cancellationToken);
 }
 
 public interface IPortConflictDetector
 {
-    Task EnsureAvailableAsync(string listenAddress, PortMapping mapping, CancellationToken cancellationToken);
+    Task<PortAvailability> EnsureAvailableAsync(string listenAddress, PortMapping mapping, PortProxyRule? ownedRule, CancellationToken cancellationToken);
 }
 
 public interface IFirewallRuleManager
@@ -23,14 +21,18 @@ public interface IFirewallRuleManager
 
 public sealed class NetshPortProxyManager(IProcessRunner processRunner) : IPortProxyManager
 {
-    public async Task ApplyAsync(string listenAddress, PortMapping mapping, string connectAddress, bool dryRun, CancellationToken cancellationToken)
+    public async Task ApplyAsync(string listenAddress, PortMapping mapping, string connectAddress, bool replaceExistingRule, bool dryRun, CancellationToken cancellationToken)
     {
         if (dryRun)
         {
             return;
         }
 
-        await DeleteAsync(listenAddress, mapping.ListenPort, cancellationToken);
+        if (replaceExistingRule)
+        {
+            await DeleteAsync(listenAddress, mapping.ListenPort, cancellationToken);
+        }
+
         var addArgs = ProcessArgumentBuilder.Join(
             "interface", "portproxy", "add", "v4tov4",
             $"listenaddress={listenAddress}",
@@ -71,6 +73,9 @@ public sealed class NetshPortProxyManager(IProcessRunner processRunner) : IPortP
 
 public sealed class NetshFirewallRuleManager(IProcessRunner processRunner) : IFirewallRuleManager
 {
+    private const string FirewallRuleExistsMarker = "WSLPORTPROXY_FIREWALL_RULE_EXISTS";
+    private const string FirewallRuleMissingMarker = "WSLPORTPROXY_FIREWALL_RULE_MISSING";
+
     public async Task EnsureAsync(string distroName, int listenPort, bool dryRun, CancellationToken cancellationToken)
     {
         if (dryRun)
@@ -78,7 +83,7 @@ public sealed class NetshFirewallRuleManager(IProcessRunner processRunner) : IFi
             return;
         }
 
-        await RemoveAsync(distroName, listenPort, dryRun: false, cancellationToken);
+        await EnsureRuleDoesNotAlreadyExistAsync(distroName, listenPort, cancellationToken);
         var args = ProcessArgumentBuilder.Join(
             "advfirewall", "firewall", "add", "rule",
             $"name={RuleOwnership.FirewallRuleName(distroName, listenPort)}",
@@ -102,6 +107,39 @@ public sealed class NetshFirewallRuleManager(IProcessRunner processRunner) : IFi
         await processRunner.RunAsync("netsh.exe", args, cancellationToken);
     }
 
+    private async Task EnsureRuleDoesNotAlreadyExistAsync(string distroName, int listenPort, CancellationToken cancellationToken)
+    {
+        var name = RuleOwnership.FirewallRuleName(distroName, listenPort);
+        var escapedName = EscapePowerShellSingleQuotedString(name);
+        var script = "$ErrorActionPreference = 'Stop'; " +
+            $"$ruleName = '{escapedName}'; " +
+            "$rule = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue | Select-Object -First 1; " +
+            $"if ($null -eq $rule) {{ Write-Output '{FirewallRuleMissingMarker}'; exit 2 }}; " +
+            $"Write-Output '{FirewallRuleExistsMarker}'; exit 0";
+        var args = ProcessArgumentBuilder.Join(
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script);
+        var result = await processRunner.RunAsync("powershell.exe", args, cancellationToken);
+        var output = $"{result.StandardOutput}{result.StandardError}";
+        if (output.Contains(FirewallRuleExistsMarker, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException($"Firewall rule '{name}' already exists. Refusing to take over a pre-existing rule.");
+        }
+
+        if (output.Contains(FirewallRuleMissingMarker, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        throw new InvalidOperationException($"Unable to inspect existing firewall rule '{name}': {output}".Trim());
+    }
+
+    private static string EscapePowerShellSingleQuotedString(string value) => value.Replace("'", "''");
+
     private async Task RequireSuccessAsync(string arguments, CancellationToken cancellationToken)
     {
         var result = await processRunner.RunAsync("netsh.exe", arguments, cancellationToken);
@@ -112,29 +150,47 @@ public sealed class NetshFirewallRuleManager(IProcessRunner processRunner) : IFi
     }
 }
 
-public sealed class PortConflictDetector(IProcessRunner processRunner) : IPortConflictDetector
+public sealed class PortConflictDetector(IProcessRunner processRunner, ITcpStateProvider? tcpStateProvider = null) : IPortConflictDetector
 {
+    private readonly ITcpStateProvider _tcpStateProvider = tcpStateProvider ?? new SystemTcpStateProvider();
+
     private static readonly Regex PortProxyLinePattern = new(
         @"^(?<listenAddress>\S+)\s+(?<listenPort>\d+)\s+(?<connectAddress>\S+)\s+(?<connectPort>\d+)$",
         RegexOptions.Compiled);
 
-    public async Task EnsureAvailableAsync(string listenAddress, PortMapping mapping, CancellationToken cancellationToken)
+    public async Task<PortAvailability> EnsureAvailableAsync(string listenAddress, PortMapping mapping, PortProxyRule? ownedRule, CancellationToken cancellationToken)
     {
+        var matchingRules = await GetMatchingPortProxyRulesAsync(listenAddress, mapping.ListenPort, cancellationToken);
+        if (matchingRules.Count > 0)
+        {
+            foreach (var existingRule in matchingRules)
+            {
+                if (ownedRule is not null && existingRule.MatchesOwnedRule(ownedRule))
+                {
+                    continue;
+                }
+
+                throw new InvalidOperationException($"Port {mapping.ListenPort} already has an existing portproxy rule on {existingRule.ListenAddress}. Refusing to take over a pre-existing mapping.");
+            }
+
+            return PortAvailability.ReplaceOwned;
+        }
+
         EnsureNoActiveListener(listenAddress, mapping.ListenPort);
-        await EnsureNoForeignPortProxyAsync(listenAddress, mapping.ListenPort, cancellationToken);
+        return PortAvailability.Available;
     }
 
-    private static void EnsureNoActiveListener(string listenAddress, int listenPort)
+    private void EnsureNoActiveListener(string listenAddress, int listenPort)
     {
-        var listeners = IPGlobalProperties.GetIPGlobalProperties().GetActiveTcpListeners();
-        var conflicts = listeners.Where(endpoint => endpoint.Port == listenPort && ListenAddressMatches(listenAddress, endpoint.Address));
+        var conflicts = _tcpStateProvider.GetActiveTcpListeners()
+            .Where(endpoint => endpoint.Port == listenPort && ListenAddressMatcher.Matches(listenAddress, endpoint.Address));
         if (conflicts.Any())
         {
             throw new InvalidOperationException($"Port {listenPort} already has a host TCP listener. Refusing to override an active service.");
         }
     }
 
-    private async Task EnsureNoForeignPortProxyAsync(string listenAddress, int listenPort, CancellationToken cancellationToken)
+    private async Task<IReadOnlyList<PortProxyRule>> GetMatchingPortProxyRulesAsync(string listenAddress, int listenPort, CancellationToken cancellationToken)
     {
         var args = ProcessArgumentBuilder.Join("interface", "portproxy", "show", "v4tov4");
         var result = await processRunner.RunAsync("netsh.exe", args, cancellationToken);
@@ -143,7 +199,15 @@ public sealed class PortConflictDetector(IProcessRunner processRunner) : IPortCo
             throw new InvalidOperationException($"Unable to inspect existing portproxy rules: {result.StandardError}{result.StandardOutput}".Trim());
         }
 
-        foreach (var line in result.StandardOutput.Split(Environment.NewLine, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        return ParsePortProxyRules(result.StandardOutput)
+            .Where(rule => rule.ListenPort == listenPort && ListenAddressMatcher.Matches(listenAddress, rule.ListenAddress))
+            .ToArray();
+    }
+
+    public static IReadOnlyList<PortProxyRule> ParsePortProxyRules(string text)
+    {
+        var rules = new List<PortProxyRule>();
+        foreach (var line in text.Split(["\r\n", "\n"], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {
             var match = PortProxyLinePattern.Match(line);
             if (!match.Success)
@@ -151,51 +215,13 @@ public sealed class PortConflictDetector(IProcessRunner processRunner) : IPortCo
                 continue;
             }
 
-            var existingListenAddress = match.Groups["listenAddress"].Value;
-            var existingListenPort = int.Parse(match.Groups["listenPort"].Value);
-            if (existingListenPort != listenPort)
-            {
-                continue;
-            }
-
-            if (ListenAddressMatches(listenAddress, existingListenAddress))
-            {
-                throw new InvalidOperationException($"Port {listenPort} already has an existing portproxy rule on {existingListenAddress}. Refusing to take over a pre-existing mapping.");
-            }
-        }
-    }
-
-    private static bool ListenAddressMatches(string requested, string existing)
-    {
-        if (string.Equals(requested, "0.0.0.0", StringComparison.Ordinal) || string.Equals(existing, "0.0.0.0", StringComparison.Ordinal))
-        {
-            return true;
+            rules.Add(new PortProxyRule(
+                match.Groups["listenAddress"].Value,
+                int.Parse(match.Groups["listenPort"].Value),
+                match.Groups["connectAddress"].Value,
+                int.Parse(match.Groups["connectPort"].Value)));
         }
 
-        if (string.Equals(requested, "*", StringComparison.Ordinal) || string.Equals(existing, "*", StringComparison.Ordinal))
-        {
-            return true;
-        }
-
-        return string.Equals(requested, existing, StringComparison.OrdinalIgnoreCase)
-            || IPAddressMatches(requested, existing);
-    }
-
-    private static bool ListenAddressMatches(string requested, System.Net.IPAddress existing)
-    {
-        if (string.Equals(requested, "0.0.0.0", StringComparison.Ordinal))
-        {
-            return existing.AddressFamily == AddressFamily.InterNetwork;
-        }
-
-        return System.Net.IPAddress.TryParse(requested, out var requestedIp)
-            && EqualityComparer<System.Net.IPAddress>.Default.Equals(requestedIp, existing);
-    }
-
-    private static bool IPAddressMatches(string left, string right)
-    {
-        return System.Net.IPAddress.TryParse(left, out var leftIp)
-            && System.Net.IPAddress.TryParse(right, out var rightIp)
-            && EqualityComparer<System.Net.IPAddress>.Default.Equals(leftIp, rightIp);
+        return rules;
     }
 }

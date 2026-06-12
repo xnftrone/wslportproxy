@@ -1,6 +1,7 @@
 using WslPortProxyGuardian;
 
-var options = CliParser.Parse(args);
+var startupArguments = StartupArguments.Parse(args);
+var options = CliParser.Parse([.. startupArguments.PublicArgs]);
 if (options.ShowHelp)
 {
     if (!string.IsNullOrWhiteSpace(options.Error))
@@ -13,14 +14,29 @@ if (options.ShowHelp)
     return string.IsNullOrWhiteSpace(options.Error) ? 0 : 1;
 }
 
-var logSink = new ConsoleLogSink();
+var logSink = LogSinkFactory.CreateDefault(startupArguments.LogFilePath, out var logFilePath);
+if (!string.IsNullOrWhiteSpace(logFilePath))
+{
+    logSink.Info($"Log file: {logFilePath}");
+}
+
+var administratorElevation = new WindowsAdministratorElevation();
+if (!administratorElevation.IsAdministrator())
+{
+    return administratorElevation.TryRelaunchElevated(startupArguments.PublicArgs, logFilePath, logSink) ? 0 : 1;
+}
+
 var processRunner = new ProcessRunner();
+var tcpStateProvider = new SystemTcpStateProvider();
 var service = new GuardianService(
     new WslAddressResolver(processRunner),
     new NetshPortProxyManager(processRunner),
     new NetshFirewallRuleManager(processRunner),
-    new PortConflictDetector(processRunner),
-    logSink);
+    new PortConflictDetector(processRunner, tcpStateProvider),
+    logSink,
+    new WindowsPrivilegeChecker(),
+    new TcpConnectionMonitor(tcpStateProvider, logSink),
+    new WslForwardingDiagnostics(processRunner, logSink));
 
 using var cts = new CancellationTokenSource();
 Console.CancelKeyPress += (_, eventArgs) =>

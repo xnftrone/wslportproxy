@@ -1,5 +1,3 @@
-using System.Security.Principal;
-
 namespace WslPortProxyGuardian;
 
 public sealed class GuardianService(
@@ -7,14 +5,22 @@ public sealed class GuardianService(
     IPortProxyManager portProxyManager,
     IFirewallRuleManager firewallRuleManager,
     IPortConflictDetector portConflictDetector,
-    ILogSink logSink)
+    ILogSink logSink,
+    IPrivilegeChecker? privilegeChecker = null,
+    IConnectionMonitor? connectionMonitor = null,
+    IForwardingDiagnostics? forwardingDiagnostics = null)
 {
-    private readonly HashSet<PortMapping> _ownedMappings = [];
+    private static readonly TimeSpan MinimumHeartbeatInterval = TimeSpan.FromMinutes(5);
+    private readonly IPrivilegeChecker _privilegeChecker = privilegeChecker ?? new WindowsPrivilegeChecker();
+    private readonly IConnectionMonitor _connectionMonitor = connectionMonitor ?? NullConnectionMonitor.Instance;
+    private readonly IForwardingDiagnostics _forwardingDiagnostics = forwardingDiagnostics ?? NullForwardingDiagnostics.Instance;
+    private readonly Dictionary<int, PortProxyRule> _ownedPortProxyRules = [];
+    private readonly HashSet<int> _ownedFirewallPorts = [];
     private bool _cleanupCompleted;
 
     public async Task<int> RunAsync(CliOptions options, CancellationToken cancellationToken)
     {
-        EnsureAdministrator();
+        _privilegeChecker.EnsureAdministrator();
 
         logSink.Info($"Starting guardian for distro '{options.Distro}' with ports: {string.Join(", ", options.Mappings)}");
         if (options.DryRun)
@@ -23,24 +29,51 @@ public sealed class GuardianService(
         }
 
         string? currentAddress = null;
-        var nextHeartbeat = DateTimeOffset.UtcNow.AddSeconds(Math.Max(options.IntervalSeconds * 5, 30));
+        var heartbeatInterval = TimeSpan.FromSeconds(Math.Max(options.IntervalSeconds * 20, (int)MinimumHeartbeatInterval.TotalSeconds));
+        var nextHeartbeat = DateTimeOffset.UtcNow.Add(heartbeatInterval);
+        var connectionDiagnosticInterval = TimeSpan.FromSeconds(Math.Max(options.IntervalSeconds * 5, 15));
+        var nextConnectionDiagnostic = DateTimeOffset.MinValue;
 
         while (!cancellationToken.IsCancellationRequested)
         {
-            var address = await addressResolver.GetPrimaryAddressAsync(options.Distro, cancellationToken);
-            if (!string.Equals(address, currentAddress, StringComparison.Ordinal))
+            var now = DateTimeOffset.UtcNow;
+            try
             {
-                logSink.Info(currentAddress is null
-                    ? $"Resolved WSL IPv4 address: {address}"
-                    : $"WSL IPv4 changed from {currentAddress} to {address}. Rebuilding managed mappings.");
+                var address = await addressResolver.GetPrimaryAddressAsync(options.Distro, cancellationToken);
+                if (!string.Equals(address, currentAddress, StringComparison.Ordinal))
+                {
+                    logSink.Info(currentAddress is null
+                        ? $"Resolved WSL IPv4 address: {address}"
+                        : $"WSL IPv4 changed from {currentAddress} to {address}. Rebuilding managed mappings.");
 
-                await ReconcileAsync(options, address, cancellationToken);
-                currentAddress = address;
+                    await ReconcileAsync(options, address, cancellationToken);
+                    currentAddress = address;
+                    await InspectForwardingAsync(options, address, cancellationToken);
+                }
+
+                ObserveConnections(options, address);
+
+                if (_connectionMonitor.ActiveConnectionCount > 0 && now >= nextConnectionDiagnostic)
+                {
+                    await InspectForwardingAsync(options, address, cancellationToken);
+                    nextConnectionDiagnostic = now.Add(connectionDiagnosticInterval);
+                }
+
+                if (now >= nextHeartbeat)
+                {
+                    logSink.Info($"Heartbeat: WSL IPv4 remains {address}; {options.Mappings.Count} managed port(s) active; {_connectionMonitor.ActiveConnectionCount} observed forwarded connection(s).");
+                    await InspectForwardingAsync(options, address, cancellationToken);
+                    nextHeartbeat = DateTimeOffset.UtcNow.Add(heartbeatInterval);
+                }
             }
-            else if (DateTimeOffset.UtcNow >= nextHeartbeat)
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
-                logSink.Info($"Heartbeat: WSL IPv4 remains {address}; {options.Mappings.Count} managed port(s) active.");
-                nextHeartbeat = DateTimeOffset.UtcNow.AddSeconds(Math.Max(options.IntervalSeconds * 5, 30));
+                throw;
+            }
+            catch (Exception ex)
+            {
+                logSink.Error($"Guardian loop failed: {ex.Message}");
+                throw;
             }
 
             await Task.Delay(TimeSpan.FromSeconds(options.IntervalSeconds), cancellationToken);
@@ -58,12 +91,13 @@ public sealed class GuardianService(
 
         _cleanupCompleted = true;
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-        foreach (var mapping in _ownedMappings)
+        foreach (var ownedRule in _ownedPortProxyRules.Values)
         {
+            var mapping = ownedRule.Mapping;
             try
             {
                 await portProxyManager.RemoveAsync(options.ListenAddress, mapping, options.DryRun, cts.Token);
-                if (options.ManageFirewall)
+                if (options.ManageFirewall && _ownedFirewallPorts.Contains(mapping.ListenPort))
                 {
                     await firewallRuleManager.RemoveAsync(options.Distro, mapping.ListenPort, options.DryRun, cts.Token);
                 }
@@ -72,7 +106,7 @@ public sealed class GuardianService(
             }
             catch (Exception ex)
             {
-                logSink.Warn($"Failed to remove managed mapping {mapping}: {ex.Message}");
+                logSink.Error($"Failed to remove managed mapping {mapping}: {ex.Message}");
             }
         }
     }
@@ -81,25 +115,65 @@ public sealed class GuardianService(
     {
         foreach (var mapping in options.Mappings)
         {
-            await portConflictDetector.EnsureAvailableAsync(options.ListenAddress, mapping, cancellationToken);
-            await portProxyManager.ApplyAsync(options.ListenAddress, mapping, connectAddress, options.DryRun, cancellationToken);
-            if (options.ManageFirewall)
+            try
             {
-                await firewallRuleManager.EnsureAsync(options.Distro, mapping.ListenPort, options.DryRun, cancellationToken);
-            }
+                _ownedPortProxyRules.TryGetValue(mapping.ListenPort, out var ownedRule);
+                var availability = await portConflictDetector.EnsureAvailableAsync(options.ListenAddress, mapping, ownedRule, cancellationToken);
+                logSink.Info(availability.ReplaceExistingRule
+                    ? $"Refreshing managed forwarding rule for TCP {options.ListenAddress}:{mapping.ListenPort}."
+                    : $"Creating forwarding rule for TCP {options.ListenAddress}:{mapping.ListenPort}.");
 
-            _ownedMappings.Add(mapping);
-            logSink.Info($"Managed TCP {options.ListenAddress}:{mapping.ListenPort} -> {connectAddress}:{mapping.ConnectPort}");
+                await portProxyManager.ApplyAsync(options.ListenAddress, mapping, connectAddress, availability.ReplaceExistingRule, options.DryRun, cancellationToken);
+                _ownedPortProxyRules[mapping.ListenPort] = new PortProxyRule(options.ListenAddress, mapping.ListenPort, connectAddress, mapping.ConnectPort);
+
+                if (options.ManageFirewall && !_ownedFirewallPorts.Contains(mapping.ListenPort))
+                {
+                    await firewallRuleManager.EnsureAsync(options.Distro, mapping.ListenPort, options.DryRun, cancellationToken);
+                    if (!options.DryRun)
+                    {
+                        _ownedFirewallPorts.Add(mapping.ListenPort);
+                    }
+                }
+
+                logSink.Info($"Forwarding TCP {options.ListenAddress}:{mapping.ListenPort} -> {connectAddress}:{mapping.ConnectPort}");
+            }
+            catch (Exception ex)
+            {
+                logSink.Error($"Failed to reconcile mapping {mapping}: {ex.Message}");
+                throw;
+            }
         }
     }
 
-    private static void EnsureAdministrator()
+    private void ObserveConnections(CliOptions options, string connectAddress)
     {
-        using var identity = WindowsIdentity.GetCurrent();
-        var principal = new WindowsPrincipal(identity);
-        if (!principal.IsInRole(WindowsBuiltInRole.Administrator))
+        try
         {
-            throw new InvalidOperationException("Run this tool from an elevated terminal.");
+            _connectionMonitor.Observe(options.ListenAddress, options.Mappings, connectAddress);
+        }
+        catch (Exception ex)
+        {
+            logSink.Error($"Failed to inspect forwarded TCP connections: {ex.Message}");
+        }
+    }
+
+    private async Task InspectForwardingAsync(CliOptions options, string connectAddress, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await _forwardingDiagnostics.InspectAsync(
+                options,
+                connectAddress,
+                _connectionMonitor.ActiveConnectionCountsByListenPort,
+                cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            logSink.Error($"Failed to run forwarding diagnostics: {ex.Message}");
         }
     }
 }

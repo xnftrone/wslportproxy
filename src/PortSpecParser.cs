@@ -25,7 +25,16 @@ public static class PortSpecParser
 
     public static IReadOnlyList<PortMapping> ParseMany(IEnumerable<string> portSpecs)
     {
-        return Expand(portSpecs).Select(ParseOne).ToArray();
+        var mappings = Expand(portSpecs).Select(ParseOne).ToArray();
+        var duplicate = mappings
+            .GroupBy(mapping => mapping.ListenPort)
+            .FirstOrDefault(group => group.Count() > 1);
+        if (duplicate is not null)
+        {
+            throw new ArgumentException($"Duplicate listen port declared: {duplicate.Key}");
+        }
+
+        return mappings;
     }
 
     public static PortMapping ParseOne(string portSpec)

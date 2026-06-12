@@ -2,102 +2,121 @@
 
 [English README](./README.en.md)
 
-`WSL PortProxy Guardian` 是一个面向 Windows 的原生命令行工具，用于持续维护从宿主机到 WSL 发行版的 TCP 端口转发。
+`WSL PortProxy Guardian` 是一个 Windows 原生命令行工具，用于持续维护从 Windows 宿主机到指定 WSL 发行版的 TCP 端口转发。
 
-它适合以下场景：
-- WSL2 使用默认 `NAT` 网络模式
-- Windows 宿主机可以访问目标网络，但目标网络不能直接访问 WSL
-- 需要把 Windows 上的指定 TCP 端口稳定转发到 WSL 内的服务
-- WSL IP 可能变化，需要自动重建转发规则
+它适用于 WSL2 默认 NAT 网络场景：Windows 可以被外部访问，但 WSL 内部服务的 IP 可能变化，导致手工维护 `netsh interface portproxy` 规则很容易失效。
 
-工具启动后会以前台进程方式持续运行，循环检查目标 WSL 发行版的 IPv4 地址。如果地址发生变化，它会自动重建你声明的端口映射。工具退出时，会自动清理当前进程托管的规则。
+## 功能
 
-## 功能特性
-
-- 基于 C# / .NET 构建，输出原生 `.exe`
 - 自动解析目标 WSL 发行版的 IPv4 地址
-- 支持多个端口
-- 支持 `监听端口:目标端口` 映射格式
-- WSL IP 变化时自动重建映射
-- 持续输出控制台日志
-- 退出时只清理自己托管的端口转发和防火墙规则
-- 如果宿主机端口已被监听，会拒绝接管
-- 如果目标端口上已有旧的 `portproxy` 规则，会拒绝覆盖
+- 支持多个 TCP 端口和 `监听端口:目标端口` 映射
+- WSL IP 变化后自动刷新本工具托管的转发规则
+- 普通权限启动时自动弹出 UAC 请求管理员权限
+- 前台持续输出日志，并为每次运行写入独立日志文件
+- 可选创建和清理 Windows 防火墙入站规则
+- 退出时只清理当前进程实际托管的规则
+- 拒绝覆盖活动 TCP 监听器、外部 `portproxy` 规则和外部同名防火墙规则
+- 通过 Windows TCP 状态和 WSL `ss` 输出诊断转发失败位置
 - 支持 `--dry-run` 预演模式
 
-## 示例
+## 快速开始
 
 ```powershell
-wslportproxy.exe run -p 4444 -p 8000 -p 8443:443
+.\build\wslportproxy.exe run -p 9999 -d kali-linux
+```
+
+第一次从普通终端启动时，工具会请求 UAC 提权。提权后的新窗口会继续运行同一条命令。
+
+常见端口写法：
+
+```powershell
+.\build\wslportproxy.exe run -p 4444 -p 8000 -p 8443:443
 ```
 
 这表示：
-- 监听 Windows `4444`，转发到 WSL `4444`
-- 监听 Windows `8000`，转发到 WSL `8000`
-- 监听 Windows `8443`，转发到 WSL `443`
+
+- Windows `4444` 转发到 WSL `4444`
+- Windows `8000` 转发到 WSL `8000`
+- Windows `8443` 转发到 WSL `443`
+
+## 日志
+
+每次运行都会在当前工作目录下创建一个独立日志文件：
+
+```text
+.\logs\wslportproxy-YYYYMMDD-HHMMSS-fff-p<PID>.log
+```
+
+日志行包含毫秒级时间戳和进程 ID。触发 UAC 时，父进程和提权后的子进程会写入同一个本次运行日志文件，方便排查新窗口一闪而过的问题。
 
 ## 用法
 
 ```powershell
-wslportproxy.exe run [options]
+.\build\wslportproxy.exe run [options]
 ```
 
-## 参数说明
+### 选项
 
 - `run`
-  启动守护模式并持续维护声明的端口映射。
+  启动守护模式，持续维护声明的端口映射。
 
-- `-p, --port <值>`
-  声明一个端口或端口映射。支持重复传入，也支持逗号分隔。
+- `-p, --port <value>`
+  声明端口或端口映射。支持重复传入，也支持逗号分隔。
+  示例：`4444`、`8443:443`、`4444,8000,8443:443`。
 
-  示例：
-  - `4444`
-  - `8000`
-  - `8443:443`
-  - `4444,8000,8443:443`
+- `-d, --distro <name>`
+  目标 WSL 发行版名称。默认：`kali-linux`。
 
-- `-d, --distro <名称>`
-  指定目标 WSL 发行版，默认值为 `kali-linux`。
+- `-l, --listen-address <address>`
+  Windows 监听地址。默认：`0.0.0.0`。
 
-- `-l, --listen-address <地址>`
-  指定 Windows 监听地址，默认值为 `0.0.0.0`。
-
-- `-i, --interval <秒>`
-  指定轮询间隔，默认值为 `3`。
+- `-i, --interval <seconds>`
+  WSL IP 和连接状态轮询间隔。默认：`3`。
 
 - `--no-firewall`
-  不自动维护 Windows 防火墙规则。
+  不自动创建或删除 Windows 防火墙规则。
 
 - `--dry-run`
-  只打印将要执行的动作，不实际修改 `portproxy` 或防火墙。
+  只输出将要执行的动作，不修改 `portproxy` 或防火墙。
 
 - `-h, --help`
-  输出帮助信息。
+  输出帮助。
 
-## 工作原理
+## 诊断能力
 
-运行时工具会：
+工具会在映射创建、WSL IP 刷新、心跳和观察到连接时输出诊断日志。
 
-1. 检查当前进程是否具有管理员权限
-2. 解析命令行参数
-3. 获取目标 WSL 发行版的当前 IPv4 地址
-4. 在修改每个端口前先进行安全检查
-5. 创建所需的 `portproxy` 和防火墙规则
-6. 定期轮询 WSL IP
-7. 当 WSL IP 变化时自动重建映射
-8. 在进程退出时清理当前运行期间托管的规则
+Windows 侧会记录声明端口上的 TCP 连接：
+
+```text
+Received TCP connection from <remote> to <local>; forwarding to <wsl-ip>:<port>
+Forwarded TCP connection closed ...
+```
+
+WSL 侧会通过 `ss -ltnp` 和 `ss -tnp` 检查目标端口：
+
+- 目标端口没有监听时输出警告
+- 服务只监听 `127.0.0.1` / `::1` 时输出警告
+- Windows 已有连接但 WSL 目标端口没有连接时输出警告
+- 能看到监听器或连接时输出对应信息，权限允许时包含进程信息
+
+如果转发后收不到请求，优先看日志中的三类信号：
+
+- 没有 `Received TCP connection`：请求可能没有到达 Windows 监听端口
+- Windows 有连接但 WSL 无连接：问题可能在 `portproxy` 到 WSL 之间
+- WSL 只监听 loopback：目标服务需要监听 `0.0.0.0`、WSL IP，或可被 `portproxy` 连接到的地址
 
 ## 安全模型
 
-这个工具采用保守策略：
+本工具采用保守策略：
 
-- 只处理你通过 `-p` / `--port` 显式声明的端口
-- 不会批量删除无关的 `portproxy` 规则
-- 不会在退出时清理未由当前进程托管的端口
-- 如果宿主机上已经有活动 TCP 监听器占用该端口，会直接拒绝接管
-- 如果该端口上已经存在旧的 `portproxy` 规则，也会直接拒绝覆盖
-
-如果你想使用某个已经被占用的端口，需要先手动释放那个端口，然后再运行工具。
+- 只处理通过 `-p` / `--port` 显式声明的端口
+- 不批量删除无关 `portproxy` 规则
+- 不删除不属于当前进程托管范围的端口映射
+- 如果宿主机上已有活动 TCP 监听器占用目标端口，拒绝修改
+- 如果目标端口上已有非本工具托管的 `portproxy` 规则，拒绝接管
+- 如果发现外部同名防火墙规则，拒绝接管
+- 不确定时默认失败退出，并保留日志
 
 ## 构建
 
@@ -109,34 +128,33 @@ wslportproxy.exe run [options]
 ### 编译
 
 ```powershell
-dotnet build .\tools\wsl-portproxy-guardian\WslPortProxyGuardian.sln
+dotnet build .\WslPortProxyGuardian.sln
 ```
 
 ### 测试
 
 ```powershell
-dotnet test .\tools\wsl-portproxy-guardian\WslPortProxyGuardian.sln
+dotnet test .\WslPortProxyGuardian.sln
 ```
 
-### 发布单文件可执行程序
+### 发布单文件版本
 
 ```powershell
-dotnet publish .\tools\wsl-portproxy-guardian\src\WslPortProxyGuardian.csproj -c Release -r win-x64 --self-contained false /p:PublishSingleFile=true -o .\tools\wsl-portproxy-guardian\build
+dotnet publish .\src\WslPortProxyGuardian.csproj -c Release -r win-x64 --self-contained false /p:PublishSingleFile=true -o .\build
 ```
 
 ## 项目结构
 
 ```text
-tools/wsl-portproxy-guardian/
-├─ src/
-├─ tests/
-├─ build/
-├─ README.md
-├─ README.en.md
-├─ AGENTS.md
-└─ AGENTS.en.md
+.
++-- src/
++-- tests/
++-- build/
++-- README.md
++-- README.en.md
+`-- AGENTS.md
 ```
 
 ## 许可证
 
-本项目使用 MIT License。正式法律文本见 [`LICENSE`](./LICENSE)。
+本项目使用 MIT License。详见 [LICENSE](./LICENSE)。

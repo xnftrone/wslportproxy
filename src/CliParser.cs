@@ -30,46 +30,46 @@ public static class CliParser
         var dryRun = false;
         var portSpecs = new List<string>();
 
-        for (var i = 1; i < args.Length; i++)
-        {
-            var arg = args[i];
-            switch (arg)
-            {
-                case "-p":
-                case "--port":
-                    i = RequireValue(args, i, arg, portSpecs);
-                    break;
-                case "-d":
-                case "--distro":
-                    i = RequireValue(args, i, arg, value => distro = value);
-                    break;
-                case "-l":
-                case "--listen-address":
-                    i = RequireValue(args, i, arg, value => listenAddress = value);
-                    break;
-                case "-i":
-                case "--interval":
-                    i = RequireValue(args, i, arg, value =>
-                    {
-                        if (!int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out intervalSeconds) || intervalSeconds < 1)
-                        {
-                            throw new ArgumentException("Interval must be a positive integer.");
-                        }
-                    });
-                    break;
-                case "--no-firewall":
-                    manageFirewall = false;
-                    break;
-                case "--dry-run":
-                    dryRun = true;
-                    break;
-                default:
-                    return CliOptions.Help(runHelp: true, error: $"Unknown option: {arg}");
-            }
-        }
-
         try
         {
+            for (var i = 1; i < args.Length; i++)
+            {
+                var arg = args[i];
+                switch (arg)
+                {
+                    case "-p":
+                    case "--port":
+                        i = RequireValue(args, i, arg, portSpecs);
+                        break;
+                    case "-d":
+                    case "--distro":
+                        i = RequireValue(args, i, arg, value => distro = value);
+                        break;
+                    case "-l":
+                    case "--listen-address":
+                        i = RequireValue(args, i, arg, value => listenAddress = value);
+                        break;
+                    case "-i":
+                    case "--interval":
+                        i = RequireValue(args, i, arg, value =>
+                        {
+                            if (!int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out intervalSeconds) || intervalSeconds < 1)
+                            {
+                                throw new ArgumentException("Interval must be a positive integer.");
+                            }
+                        });
+                        break;
+                    case "--no-firewall":
+                        manageFirewall = false;
+                        break;
+                    case "--dry-run":
+                        dryRun = true;
+                        break;
+                    default:
+                        return CliOptions.Help(runHelp: true, error: $"Unknown option: {arg}");
+                }
+            }
+
             var mappings = PortSpecParser.ParseMany(portSpecs);
             if (mappings.Count == 0)
             {

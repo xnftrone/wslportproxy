@@ -27,6 +27,15 @@ public sealed class ParserTests
     }
 
     [Fact]
+    public void ReturnsHelpForMissingOptionValue()
+    {
+        var options = CliParser.Parse(["run", "-p"]);
+
+        Assert.True(options.ShowHelp);
+        Assert.Contains("Missing value", options.Error!, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public void ExpandsPortLists()
     {
         var expanded = PortSpecParser.Expand(["4444,8000", "8443:443", "9001"]);
@@ -39,5 +48,13 @@ public sealed class ParserTests
     {
         Assert.Throws<ArgumentException>(() => PortSpecParser.ParseOne("abc"));
         Assert.Throws<ArgumentException>(() => PortSpecParser.ParseOne("70000"));
+    }
+
+    [Fact]
+    public void RejectsDuplicateListenPorts()
+    {
+        var ex = Assert.Throws<ArgumentException>(() => PortSpecParser.ParseMany(["4444", "4444:8080"]));
+
+        Assert.Contains("Duplicate listen port", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 }
